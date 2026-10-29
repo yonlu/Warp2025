@@ -1,0 +1,135 @@
+/**************************************************************************\
+*                                                                          *
+*   Copyright (C) 2026 Youko                                               *
+*                                                                          *
+*   This file is a part of WARP project (specific to RO clients)           *
+*                                                                          *
+*   WARP is free software: you can redistribute it and/or modify           *
+*   it under the terms of the GNU General Public License as published by   *
+*   the Free Software Foundation, either version 3 of the License, or      *
+*   (at your option) any later version.                                    *
+*                                                                          *
+*   This program is distributed in the hope that it will be useful,        *
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of         *
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the          *
+*   GNU General Public License for more details.                           *
+*                                                                          *
+*   You should have received a copy of the GNU General Public License      *
+*   along with this program.  If not, see <http://www.gnu.org/licenses/>.  *
+*                                                                          *
+*                                                                          *
+|**************************************************************************|
+*                                                                          *
+*   Author(s)     : Youko                                                  *
+*   Created Date  : 2026-10-29                                             *
+*   Last Modified : 2026-10-29                                             *
+*                                                                          *
+\**************************************************************************/
+
+///
+/// \brief Throttle the per-frame forced Invalidate() that UIWindowMgr issues
+///        to the windows showing an animated character.
+///
+/// Every frame the UIWindowMgr update (0xA2E7F0 on the 2025-05-29 build,
+/// PE timestamp 0x6837C229) calls Invalidate() (vftable +98h) on seven
+/// window slots unconditionally, so their character sprite animates:
+///   +3D4 UINewSelectCharWnd, +1E0 UIEquipWnd, +1E4 UInCashWnd,
+///   +3FC UIEquipWnd, +3D8 UISelCharForUServerWnd,
+///   +2C4 UINewSkillListWnd (the ALT+S skill tree), +4F070 UISecondCostumeWnd.
+/// A dirty window re-runs its whole OnDraw (every icon, GDI text, the
+/// character sprite with its Lua lookups) and re-uploads its texture, at
+/// the display frame rate.
+///
+/// The patch jumps over the five Invalidate() calls from +1E0 to +2C4
+/// unless the user-chosen interval elapsed since they last ran. Redraws the
+/// windows request themselves (equipping, clicks, packets) are untouched.
+///
+/// Default 600 ms: in a side-by-side test with both windows open it held
+/// close to the 144 fps cap (50/100/200 ms scored lower), and hover, click
+/// and preview animation still felt fine. Lower values trade frame rate
+/// for snappier hover feedback.
+///
+ThrottleUIForcedRedraw = function(_)
+{
+	$$(_, 1.1, `Find the forced Invalidate() chain`)
+	// Each link: mov ecx, [ebx+slot] / test ecx, ecx / je _next
+	//            mov eax, [ecx] / call dword ptr [eax+98h]
+	const link =
+		" 8B 8B" + POS3WC                // mov ecx, dword ptr [ebx + slot]
+	+	" 85 C9"                         // test ecx, ecx
+	+	" 74 08"                         // je _next
+	+	" 8B 01"                         // mov eax, dword ptr [ecx]
+	+	" FF 90 98 00 00 00"             // call dword ptr [eax + 98h] ; Invalidate
+	;
+
+	// The skill tree link also checks a global before invalidating.
+	const skillLink =
+		" 8B 8B" + POS3WC                // mov ecx, dword ptr [ebx + 2C4h]
+	+	" 85 C9"                         // test ecx, ecx
+	+	" 74 11"                         // je _next
+	+	" 83 3D" + ALLWC + " 00"         // cmp dword ptr [<global>], 0
+	+	" 75 08"                         // jne _next
+	+	" 8B 01"                         // mov eax, dword ptr [ecx]
+	+	" FF 90 98 00 00 00"             // call dword ptr [eax + 98h] ; Invalidate
+	;
+
+	const code = link.repeat(5) + skillLink + link;
+	const addrs = Exe.FindHexN(code);
+	if (addrs.length !== 1)
+		throw Error(`Invalidate chain matched ${addrs.length} times (expected 1)`);
+
+	$$(_, 1.2, `Locate the throttled range (second link up to the last one)`)
+	const hookAddr = addrs[0] + link.byteCount();
+	const hookVir = Exe.Phy2Vir(hookAddr, CODE);
+	const skipVir = Exe.Phy2Vir(addrs[0] + code.byteCount() - link.byteCount(), CODE);
+	const stolen = Exe.GetHex(hookAddr, 6);   // mov ecx, dword ptr [ebx + 1E0h]
+
+	$$(_, 1.3, `Get the timeGetTime import`)
+	const TimeGetTime = Exe.FindFunc("timeGetTime");
+	if (TimeGetTime < 0)
+		throw Error("timeGetTime import missing");
+
+	$$(_, 2.1, `Get the redraw interval from the user`)
+	const interval = Exe.GetUserInput('$uiForcedRedrawMs', D_Uint16, "Redraw interval",
+		"Enter the minimum time between forced redraws in ms (lower = snappier hover, higher = more fps)", 600,
+		{min: 1, max: 1000, saveDefault: true});
+	if (interval === false)
+		Cancel("Interval", 600);
+
+	$$(_, 2.2, `Allocate the last-redraw timestamp (zero => first frame redraws)`)
+	const [lastTick] = MultiAlloc(4);
+
+	$$(_, 2.3, `Construct the gate`)
+	// EAX, ECX, EDX and the flags are all rewritten before use after the chain.
+	const parts =
+	[//0
+		CALL([TimeGetTime])              // call dword ptr [<&WINMM.timeGetTime>]
+	+	MOV(EDX, EAX)                    // mov edx, eax
+	+	SUB(EDX, [lastTick])             // sub edx, dword ptr [lastTick] ; edx = elapsed
+	+	CMP(EDX, interval)               // cmp edx, interval
+	+	JB(Filler(21))                   // jb _skip
+	+	MOV([lastTick], EAX)             // mov dword ptr [lastTick], eax
+	+	stolen                           // mov ecx, dword ptr [ebx + 1E0h]
+	+	JMP(Filler(1))                   // jmp <hookAddr + 6>
+
+	,//1
+		JMP(Filler(2))                   // _skip: jmp <last link>
+	];
+
+	const [, _skip] = MapAddrs(parts);
+
+	$$(_, 2.4, `Hook the second link (6-byte MOV => JMP + NOP)`)
+	AutoHook(hookAddr, parts,
+	{
+		nops : 1,
+		localTgts : {
+			21 : _skip
+		},
+		targets : {
+			1 : hookVir + 6,
+			2 : skipVir
+		}
+	});
+
+	return true;
+};
