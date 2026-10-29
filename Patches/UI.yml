@@ -230,6 +230,12 @@ CustomUI:
             author : Louis T Steinhil , Stingor, CrazyBebop
             desc : Repaints the ALT+S Skill Tree only when its tab, hover, scroll, points, size, total skill-point level, or native dirty state changes, retaining the last render nodes on idle frames. Signature-resolved (no per-build addresses); static EXE code cave only, no DLL, runtime patcher, or recv interception.
 
+        - ThrottleUIForcedRedraw:
+            title : Throttle forced redraw of character windows
+            recommend : no
+            author : Youko
+            desc : The window manager forces the equipment (ALT+Q), skill tree (ALT+S), cash shop and server character select windows to fully repaint and re-upload every frame so their character sprite animates, which drops the frame rate while they are open. This limits that forced repaint to once per user-chosen interval (default 600 ms, which held close to a 144 fps cap with both windows open). The character animation keeps playing, and redraws the windows request themselves (equipping, clicks, packets) are unchanged.
+
         - HideZeroDateInGuildWin:
             title : Hide Zero Date in Guild Window
             recommend : no
