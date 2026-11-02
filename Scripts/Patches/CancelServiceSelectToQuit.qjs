@@ -1,0 +1,148 @@
+/**************************************************************************\
+*                                                                          *
+*   Copyright (C) 2026 Youko                                               *
+*                                                                          *
+*   This file is a part of WARP project (specific to RO clients)           *
+*                                                                          *
+*   WARP is free software: you can redistribute it and/or modify           *
+*   it under the terms of the GNU General Public License as published by   *
+*   the Free Software Foundation, either version 3 of the License, or      *
+*   (at your option) any later version.                                    *
+*                                                                          *
+*   This program is distributed in the hope that it will be useful,        *
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of         *
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the          *
+*   GNU General Public License for more details.                           *
+*                                                                          *
+*   You should have received a copy of the GNU General Public License      *
+*   along with this program.  If not, see <http://www.gnu.org/licenses/>.  *
+*                                                                          *
+*                                                                          *
+|**************************************************************************|
+*                                                                          *
+*   Author(s)     : Youko                                                  *
+*   Created Date  : 2026-11-02                                             *
+*   Last Modified : 2026-11-02                                             *
+*                                                                          *
+\**************************************************************************/
+
+///
+/// \brief Make the Cancel button of the Service Select window ask to quit
+///        instead of closing the window and leaving an empty screen.
+///
+/// UISelectServerWnd::SendMsg (0x886820 on the 2025-05-29 build, PE
+/// timestamp 0x6837C229) handles its buttons through a byte-indexed switch:
+///   B8h OK     -> CLoginMode msg <this+B8h> (2723h here, 2713h in the
+///                 character server list)
+///   B9h Cancel -> close the window, CLoginMode msg 2716h
+///   DDh Exit   -> "Are you sure you want to quit?" (MsgString 11h);
+///                 OK => CMode msg 2 (quit), Cancel => window stays
+///
+/// CLoginMode only acts on 2716h in the character server list and the two
+/// later login states. In Service Select (states 0-2) it drops the message,
+/// so the window is already gone and nothing replaces it. Only Esc still
+/// works, through the window manager's own quit prompt.
+///
+/// The patch repoints the Cancel entry of the jump table to a small cave:
+/// if the window's OK message is the Service Select one (2723h) it runs the
+/// Exit case, otherwise it falls through to the original Cancel case, so
+/// Cancel in the character server list still returns to the login window.
+///
+CancelServiceSelectToQuit = function(_)
+{
+	$$(_, 1.1, `Find the button switches shaped like UISelectServerWnd's`)
+	const code =
+		" 8B 45 10"                      // mov eax, dword ptr [ebp + 10h] ; button id
+	+	" 05 48 FF FF FF"                // add eax, -0B8h
+	+	" 3D ?? 00 00 00"                // cmp eax, <last id - 0B8h>
+	+	" 0F 87 ?? ?? ?? ??"             // ja _default
+	+	" 0F B6 80 ?? ?? ?? ??"          // movzx eax, byte ptr [eax + idxTbl]
+	+	" FF 24 85 ?? ?? ?? ??"          // jmp dword ptr [eax*4 + jmpTbl]
+	;
+	const addrs = Exe.FindHexN(code);
+	if (addrs.isEmpty())
+		throw Error("Button switch not found");
+
+	$$(_, 1.2, `Pick the one whose Cancel sends 2716h and whose Exit asks MsgString 11h`)
+	const caseVir = (idxTbl, jmpTbl, id) =>
+		Exe.GetUint32(jmpTbl + Exe.GetUint8(idxTbl + id - 0xB8) * 4);
+
+	const hasHex = (vir, hex, len) =>
+	{
+		const phy = Exe.Vir2Phy(vir, CODE);
+		return Exe.FindHex(hex, phy, phy + len) >= 0;
+	};
+
+	let found = null;
+	for (const addr of addrs)
+	{
+		const range = Exe.GetUint8(addr + 9);
+		if (range < 0xDD - 0xB8)
+			continue;
+
+		const idxTbl = Exe.Vir2Phy(Exe.GetUint32(addr + 22), CODE);
+		const jmpTbl = Exe.Vir2Phy(Exe.GetUint32(addr + 29), CODE);
+		const cancelVir = caseVir(idxTbl, jmpTbl, 0xB9);
+		const exitVir = caseVir(idxTbl, jmpTbl, 0xDD);
+
+		if (cancelVir === exitVir
+		||  !hasHex(cancelVir, PUSH(0x2716), 0x20)
+		||  !hasHex(exitVir, PUSH(0x11) + CALL(), 0x20))
+			continue;
+
+		if (found)
+			throw Error("More than one Service Select button switch matched");
+
+		found = {range, idxTbl, jmpTbl, cancelVir, exitVir, okVir : caseVir(idxTbl, jmpTbl, 0xB8)};
+	}
+	if (!found)
+		throw Error("Service Select button switch not found");
+
+	const {range, idxTbl, jmpTbl, cancelVir, exitVir, okVir} = found;
+
+	$$(_, 1.3, `Cancel must own its jump table slot (we repoint the whole slot)`)
+	const cancelIdx = Exe.GetUint8(idxTbl + 1);
+	for (let i = 0; i <= range; i++)
+	{
+		if (i !== 1 && Exe.GetUint8(idxTbl + i) === cancelIdx)
+			throw Error("Cancel shares its case with another button");
+	}
+
+	$$(_, 1.4, `Get the field holding the OK message (push dword ptr [edi + field])`)
+	const okPhy = Exe.Vir2Phy(okVir, CODE);
+	const pushAddr = Exe.FindHex(" FF B7 ?? ?? 00 00", okPhy, okPhy + 0x60);
+	if (pushAddr < 0)
+		throw Error("OK message field not found");
+
+	const msgField = Exe.GetUint32(pushAddr + 2);
+
+	$$(_, 1.5, `The Cancel case must use EDI as 'this' too (push edi)`)
+	if (Exe.GetUint8(Exe.Vir2Phy(cancelVir, CODE)) !== 0x57)
+		throw Error("Unexpected Cancel case prologue");
+
+	$$(_, 1.6, `Service Select hands the window 2723h as its OK message`)
+	const SelectServiceMsg = 0x2723;
+	if (Exe.FindHex(PUSH(SelectServiceMsg) + PUSH(0x50)) < 0)
+		throw Error("Service Select OK message not found");
+
+	$$(_, 2.1, `Construct the cave`)
+	const parts =
+		CMP([EDI, msgField], SelectServiceMsg)  // cmp dword ptr [edi + field], 2723h
+	+	JE(Filler(1))                           // je <Exit case>
+	+	JMP(Filler(2))                          // jmp <original Cancel case>
+	;
+
+	$$(_, 2.2, `Allocate and fill it`)
+	const [free, freeVir] = Exe.Allocate(parts.byteCount());
+	Exe.SetHex(free, SetFillTargets(parts,
+	{
+		start : freeVir,
+		1 : exitVir,
+		2 : cancelVir,
+	}));
+
+	$$(_, 2.3, `Repoint the Cancel slot of the jump table`)
+	Exe.SetUint32(jmpTbl + cancelIdx * 4, freeVir);
+
+	return true;
+};

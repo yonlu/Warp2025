@@ -326,3 +326,4 @@
 352 : HideItemba
 353 : ReduceExpensiveUIRender
 354 : ThrottleUIForcedRedraw
+355 : CancelServiceSelectToQuit
