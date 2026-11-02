@@ -171,6 +171,12 @@ ReturnToLogin:
             desc : Makes the Cancel button in Character selection window return to login window instead of Quitting.
             needs : RestoreLoginWindow
 
+        - CancelServiceSelectToQuit:
+            title : Cancel in Service Select asks to quit
+            recommend : no
+            author : Youko
+            desc : Clicking Cancel in the Service Select window closes it and leaves an empty screen, because the login mode ignores that message there (only Esc still offers to quit). This makes Cancel show the same "Are you sure you want to quit?" prompt as the Exit button and Esc. Cancel in the character server list (after login) keeps returning to the login window.
+
 ShowButton:
     title : SHOW BUTTON
     mutex : false
